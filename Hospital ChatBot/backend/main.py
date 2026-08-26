@@ -1,3 +1,5 @@
+import re
+
 from fastapi import (
     FastAPI,
     Depends,
@@ -36,6 +38,7 @@ from backend.services.doctor_service import (
 
 from backend.services.appointment_service import (
     get_available_slots,
+    get_slot_by_id,
     find_slot,
     book_appointment,
     get_appointment,
@@ -49,6 +52,10 @@ app = FastAPI(
 )
 
 
+# =========================================================
+# ROOT
+# =========================================================
+
 @app.get("/")
 def root():
 
@@ -59,6 +66,10 @@ def root():
     }
 
 
+# =========================================================
+# DOCTORS
+# =========================================================
+
 @app.get("/doctors")
 def doctors(
     db: Session = Depends(get_db)
@@ -68,6 +79,10 @@ def doctors(
         "doctors": get_all_doctors(db)
     }
 
+
+# =========================================================
+# DOCTOR SLOTS
+# =========================================================
 
 @app.get("/doctors/{doctor_id}/slots")
 def doctor_slots(
@@ -84,6 +99,10 @@ def doctor_slots(
         )
     }
 
+
+# =========================================================
+# APPOINTMENT DETAILS
+# =========================================================
 
 @app.get("/appointments/{appointment_id}")
 def appointment(
@@ -105,6 +124,10 @@ def appointment(
 
     return result
 
+
+# =========================================================
+# CANCEL APPOINTMENT API
+# =========================================================
 
 @app.post(
     "/appointments/{appointment_id}/cancel"
@@ -130,6 +153,10 @@ def cancel(
 
     return result
 
+
+# =========================================================
+# BLOCK SLOT
+# =========================================================
 
 @app.post(
     "/admin/slots/{slot_id}/block"
@@ -172,6 +199,10 @@ def block_slot(
     }
 
 
+# =========================================================
+# UNBLOCK SLOT
+# =========================================================
+
 @app.post(
     "/admin/slots/{slot_id}/unblock"
 )
@@ -213,6 +244,274 @@ def unblock_slot(
     }
 
 
+# =========================================================
+# HELPER:
+# LAST ASSISTANT MESSAGE
+# =========================================================
+
+def get_last_assistant_message(
+    history
+):
+
+    for message in reversed(history):
+
+        if message.get(
+            "role"
+        ) == "assistant":
+
+            return message.get(
+                "content",
+                ""
+            )
+
+    return ""
+
+
+# =========================================================
+# HELPER:
+# REQUESTED SLOT ID
+# =========================================================
+
+def get_requested_slot_id(
+    message: str
+):
+
+    matches = re.findall(
+        r"\b(?:slot\s*(?:id)?\s*)?(\d+)\b",
+        message.lower()
+    )
+
+    if not matches:
+
+        return None
+
+    return int(matches[0])
+
+
+# =========================================================
+# HELPER:
+# OFFERED SLOT IDS
+# =========================================================
+
+def get_offered_slot_ids(
+    history
+):
+
+    offered_slot_ids = set()
+
+    for message in reversed(history):
+
+        if message.get(
+            "role"
+        ) != "assistant":
+
+            continue
+
+        content = message.get(
+            "content",
+            ""
+        )
+
+        matches = re.findall(
+            r"slot\s+ID\s+(\d+)",
+            content,
+            re.IGNORECASE
+        )
+
+        for value in matches:
+
+            offered_slot_ids.add(
+                int(value)
+            )
+
+        if (
+            "available appointments"
+            in content.lower()
+        ):
+
+            break
+
+    return offered_slot_ids
+
+
+# =========================================================
+# HELPER:
+# PREVIOUS SLOT SELECTION
+# =========================================================
+
+def get_previous_selected_slot_id(
+    history
+):
+
+    for index in range(
+        len(history) - 1,
+        -1,
+        -1
+    ):
+
+        message = history[index]
+
+        if message.get(
+            "role"
+        ) != "user":
+
+            continue
+
+        content = (
+            message.get(
+                "content",
+                ""
+            )
+            .strip()
+        )
+
+        if not content.isdigit():
+
+            continue
+
+        possible_slot_id = int(
+            content
+        )
+
+        if index == 0:
+
+            continue
+
+        previous_message = history[
+            index - 1
+        ]
+
+        if previous_message.get(
+            "role"
+        ) != "assistant":
+
+            continue
+
+        previous_content = previous_message.get(
+            "content",
+            ""
+        )
+
+        if re.search(
+            rf"slot\s+ID\s+{possible_slot_id}\b",
+            previous_content,
+            re.IGNORECASE
+        ):
+
+            return possible_slot_id
+
+    return None
+
+
+# =========================================================
+# HELPER:
+# DETECT CANCELLATION FLOW
+# =========================================================
+
+def is_cancellation_flow(
+    history
+):
+
+    last_assistant_message = (
+        get_last_assistant_message(
+            history
+        )
+    )
+
+    message = (
+        last_assistant_message.lower()
+    )
+
+    cancellation_phrases = [
+
+        "cancel your appointment",
+
+        "cancel the appointment",
+
+        "cancel your booking",
+
+        "cancel the booking",
+
+        "appointment id or",
+
+        "appointment id,",
+
+        "phone number used when booking",
+
+        "phone number used for the booking",
+
+        "information so i can locate and cancel",
+
+        "locate and cancel"
+    ]
+
+    return any(
+        phrase in message
+        for phrase in cancellation_phrases
+    )
+
+
+# =========================================================
+# HELPER:
+# EXTRACT APPOINTMENT ID
+# =========================================================
+
+def extract_appointment_id(
+    message: str
+):
+
+    # Plain number:
+    #
+    # 2
+    #
+    cleaned = message.strip()
+
+    if cleaned.isdigit():
+
+        return int(cleaned)
+
+    # Appointment ID 2
+    match = re.search(
+        r"appointment\s*(?:id|number)?\s*[:#-]?\s*(\d+)",
+        message,
+        re.IGNORECASE
+    )
+
+    if match:
+
+        return int(
+            match.group(1)
+        )
+
+    return None
+
+
+# =========================================================
+# HELPER:
+# EXTRACT PHONE
+# =========================================================
+
+def extract_phone(
+    message: str
+):
+
+    digits = "".join(
+        character
+        for character in message
+        if character.isdigit()
+    )
+
+    if len(digits) >= 7:
+
+        return digits
+
+    return None
+
+
+# =========================================================
+# CHAT
+# =========================================================
+
 @app.post(
     "/chat",
     response_model=ChatResponse
@@ -222,9 +521,9 @@ def chat(
     db: Session = Depends(get_db)
 ):
 
-    # ----------------------------------
+    # =====================================================
     # 1. INPUT GUARDRAIL
-    # ----------------------------------
+    # =====================================================
 
     allowed, refusal = input_guardrail(
         request.message
@@ -236,9 +535,9 @@ def chat(
             answer=refusal
         )
 
-    # ----------------------------------
-    # 2. CONVERSATION HISTORY
-    # ----------------------------------
+    # =====================================================
+    # 2. HISTORY
+    # =====================================================
 
     history_text = ""
 
@@ -258,70 +557,604 @@ def chat(
             f"{role}: {content}\n"
         )
 
-    # ----------------------------------
-    # 3. INTENT CLASSIFICATION
-    # ----------------------------------
+    # =====================================================
+    # 3. CLASSIFY INTENT
+    # =====================================================
 
     intent = classify_intent(
         request.message,
         history_text
     )
 
-    # ----------------------------------
+    # =====================================================
+    # 3A. CANCELLATION FLOW OVERRIDE
+    #
+    # This MUST happen before slot selection.
+    # =====================================================
+
+    cancellation_flow = (
+        is_cancellation_flow(
+            request.history
+        )
+    )
+
+    if cancellation_flow:
+
+        intent.intent = (
+            "cancel_appointment"
+        )
+
+        # -----------------------------------------------
+        # If user gives appointment ID.
+        # -----------------------------------------------
+
+        appointment_id = (
+            extract_appointment_id(
+                request.message
+            )
+        )
+
+        if appointment_id is not None:
+
+            intent.appointment_id = (
+                appointment_id
+            )
+
+        # -----------------------------------------------
+        # If user gives phone number.
+        # -----------------------------------------------
+
+        else:
+
+            phone = extract_phone(
+                request.message
+            )
+
+            if phone:
+
+                intent.phone = phone
+
+    # =====================================================
+    # 3B. SLOT SELECTION
+    #
+    # IMPORTANT:
+    # Do NOT run this when cancellation flow is active.
+    # =====================================================
+
+    if not cancellation_flow:
+
+        requested_slot_id = (
+            get_requested_slot_id(
+                request.message
+            )
+        )
+
+        last_assistant_message = (
+            get_last_assistant_message(
+                request.history
+            )
+        )
+
+        offered_slot_ids = (
+            get_offered_slot_ids(
+                request.history
+            )
+        )
+
+        if (
+            requested_slot_id is not None
+            and (
+                "slot ID"
+                in last_assistant_message
+
+                or "available appointments"
+                in last_assistant_message.lower()
+            )
+        ):
+
+            intent.intent = (
+                "book_appointment"
+            )
+
+            intent.slot_id = (
+                requested_slot_id
+            )
+
+            if (
+                offered_slot_ids
+                and requested_slot_id
+                not in offered_slot_ids
+            ):
+
+                return ChatResponse(
+                    answer=(
+                        f"Slot {requested_slot_id} "
+                        "is not one of the currently "
+                        "available appointments. "
+                        "Please choose one of the "
+                        "slot IDs shown above."
+                    )
+                )
+
+    # =====================================================
+    # 3C. RECOVER PREVIOUS SLOT
+    # =====================================================
+
+    if (
+        not cancellation_flow
+        and intent.intent == "book_appointment"
+        and intent.slot_id is None
+    ):
+
+        previous_slot_id = (
+            get_previous_selected_slot_id(
+                request.history
+            )
+        )
+
+        if previous_slot_id is not None:
+
+            intent.slot_id = (
+                previous_slot_id
+            )
+
+    # =====================================================
+    # 3D. PATIENT NAME
+    # =====================================================
+
+    last_assistant_message = (
+        get_last_assistant_message(
+            request.history
+        )
+    )
+
+    if (
+        not cancellation_flow
+        and "patient's full name"
+        in last_assistant_message.lower()
+        and not intent.patient_name
+    ):
+
+        intent.patient_name = (
+            request.message.strip()
+        )
+
+        intent.intent = (
+            "book_appointment"
+        )
+
+    # =====================================================
+    # 3E. PHONE DURING BOOKING
+    # =====================================================
+
+    if (
+        not cancellation_flow
+        and "phone number"
+        in last_assistant_message.lower()
+        and not intent.phone
+    ):
+
+        phone_digits = extract_phone(
+            request.message
+        )
+
+        if phone_digits:
+
+            intent.phone = (
+                request.message.strip()
+            )
+
+            intent.intent = (
+                "book_appointment"
+            )
+
+    # =====================================================
+    # 3F. RESOLVE SELECTED SLOT
+    # =====================================================
+
+    if (
+        not cancellation_flow
+        and intent.intent == "book_appointment"
+        and intent.slot_id is not None
+    ):
+
+        selected_slot = get_slot_by_id(
+            db,
+            intent.slot_id
+        )
+
+        if not selected_slot:
+
+            return ChatResponse(
+                answer=(
+                    "I couldn't find the selected "
+                    "appointment slot."
+                )
+            )
+
+        if selected_slot["status"] != "AVAILABLE":
+
+            return ChatResponse(
+                answer=(
+                    "Sorry, that appointment slot "
+                    "is no longer available. Please "
+                    "choose another available slot."
+                )
+            )
+
+        if not intent.doctor_name:
+
+            intent.doctor_name = (
+                selected_slot["doctor_name"]
+            )
+
+        if not intent.date:
+
+            intent.date = (
+                selected_slot["start_time"]
+                .strftime("%Y-%m-%d")
+            )
+
+        if not intent.time:
+
+            intent.time = (
+                selected_slot["start_time"]
+                .strftime("%H:%M")
+            )
+
+    # =====================================================
     # 4. EMERGENCY
-    # ----------------------------------
+    # =====================================================
 
     if intent.intent == "emergency":
 
-        answer = (
-            "If you believe this is a medical emergency, "
-            "please seek immediate emergency medical care "
-            "or contact the hospital emergency department. "
-            "I can also help you find the appropriate "
-            "hospital department."
-        )
-
         return ChatResponse(
-            answer=answer
+            answer=(
+                "If you believe this is a medical "
+                "emergency, please seek immediate "
+                "emergency medical care or contact "
+                "the hospital emergency department. "
+                "I can also help you find the "
+                "appropriate hospital department."
+            )
         )
 
-    # ----------------------------------
-    # 5. UNRELATED
-    # ----------------------------------
+    # =====================================================
+    # 5. OUT OF SCOPE
+    # =====================================================
 
     if intent.intent == "other":
 
         return ChatResponse(
             answer=(
-                "I'm the ABC Multispeciality Hospital "
-                "virtual assistant. I can help with doctors, "
-                "appointments, hospital information and "
-                "insurance questions."
+                "I can only answer questions related "
+                "to ABC Multispeciality Hospital, "
+                "such as doctors, appointments, "
+                "hospital information, departments, "
+                "and insurance. How can I help you?"
             )
         )
 
-    # ----------------------------------
+    # =====================================================
     # 6. MEDICAL GUIDANCE
-    # ----------------------------------
+    # =====================================================
 
     if intent.intent == "medical_guidance":
 
         return ChatResponse(
             answer=(
                 "I can help you find the appropriate "
-                "hospital department or doctor, but I "
-                "cannot diagnose conditions or prescribe "
-                "medication. Please tell me about the "
-                "type of concern you would like help "
-                "finding a specialist for."
+                "hospital department or doctor, but "
+                "I cannot diagnose conditions or "
+                "prescribe medication. Please tell "
+                "me about the type of concern you "
+                "would like help finding a specialist for."
             )
         )
 
-    # ----------------------------------
-    # 7. DOCTOR RECOMMENDATION
-    # ----------------------------------
+    # =====================================================
+    # 7. CANCEL APPOINTMENT
+    # =====================================================
+
+    if intent.intent == "cancel_appointment":
+
+        # -------------------------------------------------
+        # A. Get appointment ID from intent/message.
+        # -------------------------------------------------
+
+        appointment_id = (
+            intent.appointment_id
+        )
+
+        if appointment_id is None:
+
+            appointment_id = (
+                extract_appointment_id(
+                    request.message
+                )
+            )
+
+        # -------------------------------------------------
+        # B. If no appointment ID, try phone.
+        # -------------------------------------------------
+
+        phone = intent.phone
+
+        if not phone:
+
+            phone = extract_phone(
+                request.message
+            )
+
+        # -------------------------------------------------
+        # C. We need some identifier.
+        # -------------------------------------------------
+
+        if (
+            appointment_id is None
+            and not phone
+        ):
+
+            return ChatResponse(
+                answer=(
+                    "Please provide your appointment "
+                    "ID or the phone number used when "
+                    "booking the appointment so I can "
+                    "locate and cancel it."
+                )
+            )
+
+        # -------------------------------------------------
+        # D. Cancellation by appointment ID.
+        # -------------------------------------------------
+
+        if appointment_id is not None:
+
+            appointment = get_appointment(
+                db,
+                appointment_id
+            )
+
+            if not appointment:
+
+                return ChatResponse(
+                    answer=(
+                        f"I couldn't find appointment "
+                        f"{appointment_id} in the "
+                        "hospital database."
+                    )
+                )
+
+            # The get_appointment() query returns the
+            # patient's phone number.
+
+            appointment_phone = (
+                appointment.get("phone")
+            )
+
+            if not appointment_phone:
+
+                return ChatResponse(
+                    answer=(
+                        "I found the appointment, but "
+                        "I couldn't verify the patient's "
+                        "phone number. Please provide "
+                        "the phone number used for booking."
+                    )
+                )
+
+            result = cancel_appointment(
+                db=db,
+                appointment_id=appointment_id,
+                phone=appointment_phone
+            )
+
+            if not result["success"]:
+
+                return ChatResponse(
+                    answer=result["message"]
+                )
+
+            # ---------------------------------------------
+            # Use the appointment information that we
+            # already retrieved before cancellation.
+            # ---------------------------------------------
+
+            doctor_name = (
+                appointment["doctor_name"]
+            )
+
+            patient_name = (
+                appointment["patient_name"]
+            )
+
+            start_time = (
+                appointment["start_time"]
+            )
+
+            return ChatResponse(
+                answer=(
+                    f"Your appointment with "
+                    f"{doctor_name} on "
+                    f"{start_time.strftime('%Y-%m-%d')} "
+                    f"at "
+                    f"{start_time.strftime('%H:%M')} "
+                    f"(Appointment ID: "
+                    f"{appointment_id}) "
+                    f"for {patient_name} has been "
+                    "successfully cancelled.\n\n"
+                    "The appointment slot is now "
+                    "available again."
+                )
+            )
+
+        # -------------------------------------------------
+        # E. Cancellation by phone.
+        # -------------------------------------------------
+
+        result = db.execute(
+            text("""
+                SELECT
+                    a.id AS appointment_id,
+                    a.status,
+                    a.slot_id,
+                    a.doctor_id,
+
+                    p.name AS patient_name,
+                    p.phone,
+
+                    d.name AS doctor_name,
+
+                    s.start_time,
+                    s.end_time
+
+                FROM appointments a
+
+                JOIN patients p
+                    ON p.id = a.patient_id
+
+                JOIN doctors d
+                    ON d.id = a.doctor_id
+
+                JOIN appointment_slots s
+                    ON s.id = a.slot_id
+
+                WHERE p.phone = :phone
+
+                AND a.status = 'CONFIRMED'
+
+                ORDER BY s.start_time ASC
+
+                LIMIT 1
+            """),
+            {
+                "phone": phone
+            }
+        )
+
+        appointment = result.fetchone()
+
+        if not appointment:
+
+            return ChatResponse(
+                answer=(
+                    "I couldn't find a confirmed "
+                    "appointment associated with that "
+                    "phone number."
+                )
+            )
+
+        cancel_result = cancel_appointment(
+            db=db,
+            appointment_id=appointment.appointment_id,
+            phone=phone
+        )
+
+        if not cancel_result["success"]:
+
+            return ChatResponse(
+                answer=cancel_result["message"]
+            )
+
+        return ChatResponse(
+            answer=(
+                f"Your appointment with "
+                f"{appointment.doctor_name} on "
+                f"{appointment.start_time.strftime('%Y-%m-%d')} "
+                f"at "
+                f"{appointment.start_time.strftime('%H:%M')} "
+                f"(Appointment ID: "
+                f"{appointment.appointment_id}) "
+                f"for {appointment.patient_name} "
+                "has been successfully cancelled.\n\n"
+                "The appointment slot is now "
+                "available again."
+            )
+        )
+
+    # =====================================================
+    # 8. DOCTOR RECOMMENDATION
+    # =====================================================
 
     if intent.intent == "doctor_recommendation":
+
+        if not intent.specialty:
+
+            message_lower = (
+                request.message.lower()
+            )
+
+            if any(
+                keyword in message_lower
+                for keyword in [
+                    "knee",
+                    "joint",
+                    "bone",
+                    "fracture",
+                    "back pain",
+                    "neck pain",
+                    "shoulder pain",
+                    "hip pain"
+                ]
+            ):
+
+                intent.specialty = (
+                    "Orthopedics"
+                )
+
+            elif any(
+                keyword in message_lower
+                for keyword in [
+                    "skin",
+                    "rash",
+                    "acne",
+                    "skin problem"
+                ]
+            ):
+
+                intent.specialty = (
+                    "Dermatology"
+                )
+
+            elif any(
+                keyword in message_lower
+                for keyword in [
+                    "heart",
+                    "cardiac"
+                ]
+            ):
+
+                intent.specialty = (
+                    "Cardiology"
+                )
+
+            elif any(
+                keyword in message_lower
+                for keyword in [
+                    "child",
+                    "children",
+                    "baby",
+                    "pediatric"
+                ]
+            ):
+
+                intent.specialty = (
+                    "Pediatrics"
+                )
+
+            elif any(
+                keyword in message_lower
+                for keyword in [
+                    "cold",
+                    "fever",
+                    "cough",
+                    "flu"
+                ]
+            ):
+
+                intent.specialty = (
+                    "General Medicine"
+                )
 
         if not intent.specialty:
 
@@ -329,8 +1162,8 @@ def chat(
                 answer=(
                     "I can help you find an appropriate "
                     "hospital specialty. Please briefly "
-                    "describe the health concern you would "
-                    "like help navigating."
+                    "describe the health concern you "
+                    "would like help navigating."
                 )
             )
 
@@ -353,14 +1186,9 @@ def chat(
             request.message
         )
 
-        doctor_context = "\n".join(
-            str(doctor)
-            for doctor in doctors
-        )
-
         context += (
             "\n\nDATABASE DOCTOR RESULTS:\n"
-            + doctor_context
+            + str(doctors)
         )
 
         answer = generate_response(
@@ -372,17 +1200,19 @@ def chat(
         if not output_guardrail(answer):
 
             answer = (
-                "I can help you find a hospital specialist, "
-                "but I cannot provide a diagnosis."
+                f"For this concern, the "
+                f"{intent.specialty} department "
+                "would be the appropriate place "
+                "to start."
             )
 
         return ChatResponse(
             answer=answer
         )
 
-    # ----------------------------------
-    # 8. DOCTOR SEARCH
-    # ----------------------------------
+    # =====================================================
+    # 9. DOCTOR SEARCH
+    # =====================================================
 
     if intent.intent == "doctor_search":
 
@@ -408,7 +1238,9 @@ def chat(
 
         else:
 
-            doctors = get_all_doctors(db)
+            doctors = get_all_doctors(
+                db
+            )
 
         if not doctors:
 
@@ -438,9 +1270,9 @@ def chat(
             answer=answer
         )
 
-    # ----------------------------------
-    # 9. AVAILABILITY
-    # ----------------------------------
+    # =====================================================
+    # 10. AVAILABILITY
+    # =====================================================
 
     if intent.intent == "availability":
 
@@ -516,9 +1348,9 @@ def chat(
             )
         )
 
-    # ----------------------------------
-    # 10. BOOK APPOINTMENT
-    # ----------------------------------
+    # =====================================================
+    # 11. BOOK APPOINTMENT
+    # =====================================================
 
     if intent.intent == "book_appointment":
 
@@ -606,12 +1438,42 @@ def chat(
                 )
             )
 
-        slot = find_slot(
-            db,
-            doctor["id"],
-            intent.date,
-            intent.time
-        )
+        slot = None
+
+        if intent.slot_id is not None:
+
+            slot = get_slot_by_id(
+                db,
+                intent.slot_id
+            )
+
+            if not slot:
+
+                return ChatResponse(
+                    answer=(
+                        "I couldn't find the selected "
+                        "appointment slot."
+                    )
+                )
+
+            if slot["status"] != "AVAILABLE":
+
+                return ChatResponse(
+                    answer=(
+                        "Sorry, that appointment slot "
+                        "is no longer available. Please "
+                        "choose another available slot."
+                    )
+                )
+
+        else:
+
+            slot = find_slot(
+                db,
+                doctor["id"],
+                intent.date,
+                intent.time
+            )
 
         if not slot:
 
@@ -651,9 +1513,9 @@ def chat(
             ]
         )
 
-    # ----------------------------------
-    # 11. INSURANCE
-    # ----------------------------------
+    # =====================================================
+    # 12. INSURANCE
+    # =====================================================
 
     if intent.intent == "insurance":
 
@@ -702,20 +1564,21 @@ def chat(
         if not output_guardrail(answer):
 
             answer = (
-                "I can provide general insurance information "
-                "from the hospital's records, but I cannot "
-                "guarantee coverage or approval. Please "
-                "confirm your specific policy with the "
-                "hospital insurance desk."
+                "I can provide general insurance "
+                "information from the hospital's "
+                "records, but I cannot guarantee "
+                "coverage or approval. Please confirm "
+                "your specific policy with the hospital "
+                "insurance desk."
             )
 
         return ChatResponse(
             answer=answer
         )
 
-    # ----------------------------------
-    # 12. GENERAL HOSPITAL INFORMATION
-    # ----------------------------------
+    # =====================================================
+    # 13. GENERAL HOSPITAL INFORMATION
+    # =====================================================
 
     context = retrieve_documents(
         request.message
@@ -730,8 +1593,8 @@ def chat(
     if not output_guardrail(answer):
 
         answer = (
-            "I can only provide information based on "
-            "the hospital's approved information."
+            "I can only provide information based "
+            "on the hospital's approved information."
         )
 
     return ChatResponse(

@@ -1,7 +1,9 @@
-from datetime import datetime
-
 from sqlalchemy import text
 
+
+# =========================================================
+# GET AVAILABLE SLOTS
+# =========================================================
 
 def get_available_slots(
     db,
@@ -18,6 +20,7 @@ def get_available_slots(
                 d.specialty,
                 s.start_time,
                 s.end_time
+
             FROM appointment_slots s
 
             JOIN doctors d
@@ -43,6 +46,52 @@ def get_available_slots(
     ]
 
 
+# =========================================================
+# GET SLOT BY ID
+# =========================================================
+
+def get_slot_by_id(
+    db,
+    slot_id: int
+):
+
+    result = db.execute(
+        text("""
+            SELECT
+                s.id AS slot_id,
+                s.doctor_id,
+                s.start_time,
+                s.end_time,
+                s.status,
+                d.name AS doctor_name,
+                d.specialty
+
+            FROM appointment_slots s
+
+            JOIN doctors d
+                ON d.id = s.doctor_id
+
+            WHERE s.id = :slot_id
+
+            LIMIT 1
+        """),
+        {
+            "slot_id": slot_id
+        }
+    )
+
+    row = result.fetchone()
+
+    if not row:
+        return None
+
+    return dict(row._mapping)
+
+
+# =========================================================
+# FIND SLOT BY DOCTOR + DATE + TIME
+# =========================================================
+
 def find_slot(
     db,
     doctor_id: int,
@@ -57,8 +106,10 @@ def find_slot(
                 s.doctor_id,
                 s.start_time,
                 s.end_time,
+                s.status,
                 d.name AS doctor_name,
                 d.specialty
+
             FROM appointment_slots s
 
             JOIN doctors d
@@ -72,6 +123,8 @@ def find_slot(
                 s.start_time,
                 'HH24:MI'
             ) = :time
+
+            AND s.status = 'AVAILABLE'
 
             LIMIT 1
         """),
@@ -89,6 +142,10 @@ def find_slot(
 
     return dict(row._mapping)
 
+
+# =========================================================
+# GET APPOINTMENT
+# =========================================================
 
 def get_appointment(
     db,
@@ -137,6 +194,10 @@ def get_appointment(
     return dict(row._mapping)
 
 
+# =========================================================
+# BOOK APPOINTMENT
+# =========================================================
+
 def book_appointment(
     db,
     patient_name: str,
@@ -147,145 +208,205 @@ def book_appointment(
 
     try:
 
-        # IMPORTANT:
-        # Start transaction.
-        with db.begin():
+        # -------------------------------------------------
+        # 1. Lock and fetch the slot
+        # -------------------------------------------------
 
-            # Lock the exact slot.
-            slot = db.execute(
-                text("""
-                    SELECT
-                        id,
-                        doctor_id,
-                        start_time,
-                        end_time,
-                        status
+        slot = db.execute(
+            text("""
+                SELECT
+                    id,
+                    doctor_id,
+                    start_time,
+                    end_time,
+                    status
 
-                    FROM appointment_slots
+                FROM appointment_slots
 
-                    WHERE id = :slot_id
+                WHERE id = :slot_id
 
-                    FOR UPDATE
-                """),
-                {
-                    "slot_id": slot_id
-                }
-            ).fetchone()
+                FOR UPDATE
+            """),
+            {
+                "slot_id": slot_id
+            }
+        ).fetchone()
 
-            if not slot:
+        if not slot:
 
-                return {
-                    "success": False,
-                    "message": "Appointment slot does not exist."
-                }
+            db.rollback()
 
-            # This is the critical check.
-            if slot.status != "AVAILABLE":
-
-                return {
-                    "success": False,
-                    "message": (
-                        "Sorry, this appointment slot "
-                        "is no longer available."
-                    )
-                }
-
-            # Check doctor.
-            if slot.doctor_id != doctor_id:
-
-                return {
-                    "success": False,
-                    "message": (
-                        "The selected doctor does not "
-                        "match this appointment slot."
-                    )
-                }
-
-            # Find existing patient.
-            patient = db.execute(
-                text("""
-                    SELECT id
-                    FROM patients
-                    WHERE phone = :phone
-                """),
-                {
-                    "phone": phone
-                }
-            ).fetchone()
-
-            if patient:
-
-                patient_id = patient.id
-
-                db.execute(
-                    text("""
-                        UPDATE patients
-                        SET name = :name
-                        WHERE id = :patient_id
-                    """),
-                    {
-                        "name": patient_name,
-                        "patient_id": patient_id
-                    }
+            return {
+                "success": False,
+                "message": (
+                    "Appointment slot does not exist."
                 )
+            }
 
-            else:
+        # -------------------------------------------------
+        # 2. Check availability
+        # -------------------------------------------------
 
-                result = db.execute(
-                    text("""
-                        INSERT INTO patients
-                        (name, phone)
-                        VALUES
-                        (:name, :phone)
-                        RETURNING id
-                    """),
-                    {
-                        "name": patient_name,
-                        "phone": phone
-                    }
+        if slot.status != "AVAILABLE":
+
+            db.rollback()
+
+            return {
+                "success": False,
+                "message": (
+                    "Sorry, this appointment slot "
+                    "is no longer available."
                 )
+            }
 
-                patient_id = result.fetchone().id
+        # -------------------------------------------------
+        # 3. Verify doctor
+        # -------------------------------------------------
 
-            # Mark slot BOOKED.
+        if slot.doctor_id != doctor_id:
+
+            db.rollback()
+
+            return {
+                "success": False,
+                "message": (
+                    "The selected doctor does not "
+                    "match this appointment slot."
+                )
+            }
+
+        # -------------------------------------------------
+        # 4. Find existing patient
+        # -------------------------------------------------
+
+        patient = db.execute(
+            text("""
+                SELECT
+                    id
+
+                FROM patients
+
+                WHERE phone = :phone
+            """),
+            {
+                "phone": phone
+            }
+        ).fetchone()
+
+        if patient:
+
+            patient_id = patient.id
+
+            # Update patient's name.
             db.execute(
                 text("""
-                    UPDATE appointment_slots
-                    SET status = 'BOOKED'
-                    WHERE id = :slot_id
+                    UPDATE patients
+
+                    SET name = :name
+
+                    WHERE id = :patient_id
                 """),
                 {
-                    "slot_id": slot_id
+                    "name": patient_name,
+                    "patient_id": patient_id
                 }
             )
 
-            # Create appointment.
+        else:
+
             result = db.execute(
                 text("""
-                    INSERT INTO appointments
+                    INSERT INTO patients
                     (
-                        patient_id,
-                        doctor_id,
-                        slot_id,
-                        status
+                        name,
+                        phone
                     )
+
                     VALUES
                     (
-                        :patient_id,
-                        :doctor_id,
-                        :slot_id,
-                        'CONFIRMED'
+                        :name,
+                        :phone
                     )
+
                     RETURNING id
                 """),
                 {
-                    "patient_id": patient_id,
-                    "doctor_id": doctor_id,
-                    "slot_id": slot_id
+                    "name": patient_name,
+                    "phone": phone
                 }
             )
 
-            appointment_id = result.fetchone().id
+            patient_id = result.fetchone().id
+
+        # -------------------------------------------------
+        # 5. Mark slot as BOOKED
+        # -------------------------------------------------
+
+        update_result = db.execute(
+            text("""
+                UPDATE appointment_slots
+
+                SET status = 'BOOKED'
+
+                WHERE id = :slot_id
+
+                AND status = 'AVAILABLE'
+            """),
+            {
+                "slot_id": slot_id
+            }
+        )
+
+        if update_result.rowcount == 0:
+
+            db.rollback()
+
+            return {
+                "success": False,
+                "message": (
+                    "Sorry, this appointment slot "
+                    "is no longer available."
+                )
+            }
+
+        # -------------------------------------------------
+        # 6. Create appointment
+        # -------------------------------------------------
+
+        result = db.execute(
+            text("""
+                INSERT INTO appointments
+                (
+                    patient_id,
+                    doctor_id,
+                    slot_id,
+                    status
+                )
+
+                VALUES
+                (
+                    :patient_id,
+                    :doctor_id,
+                    :slot_id,
+                    'CONFIRMED'
+                )
+
+                RETURNING id
+            """),
+            {
+                "patient_id": patient_id,
+                "doctor_id": doctor_id,
+                "slot_id": slot_id
+            }
+        )
+
+        appointment_id = result.fetchone().id
+
+        # -------------------------------------------------
+        # 7. Commit
+        # -------------------------------------------------
+
+        db.commit()
 
         return {
             "success": True,
@@ -301,6 +422,10 @@ def book_appointment(
         raise
 
 
+# =========================================================
+# CANCEL APPOINTMENT
+# =========================================================
+
 def cancel_appointment(
     db,
     appointment_id: int,
@@ -309,74 +434,218 @@ def cancel_appointment(
 
     try:
 
-        with db.begin():
+        # -------------------------------------------------
+        # 1. Find and lock the appointment
+        # -------------------------------------------------
 
-            appointment = db.execute(
-                text("""
-                    SELECT
-                        a.id,
-                        a.slot_id,
-                        a.status
+        appointment = db.execute(
+            text("""
+                SELECT
+                    a.id,
+                    a.slot_id,
+                    a.doctor_id,
+                    a.status,
 
-                    FROM appointments a
+                    p.name AS patient_name,
+                    p.phone
 
-                    JOIN patients p
-                        ON p.id = a.patient_id
+                FROM appointments a
 
-                    WHERE a.id = :appointment_id
-                    AND p.phone = :phone
+                JOIN patients p
+                    ON p.id = a.patient_id
 
-                    FOR UPDATE
-                """),
-                {
-                    "appointment_id": appointment_id,
-                    "phone": phone
-                }
-            ).fetchone()
+                WHERE a.id = :appointment_id
 
-            if not appointment:
+                AND p.phone = :phone
 
-                return {
-                    "success": False,
-                    "message": (
-                        "Appointment not found."
-                    )
-                }
+                FOR UPDATE
+            """),
+            {
+                "appointment_id": appointment_id,
+                "phone": phone
+            }
+        ).fetchone()
 
-            if appointment.status != "CONFIRMED":
+        if not appointment:
 
-                return {
-                    "success": False,
-                    "message": (
-                        "This appointment cannot be cancelled."
-                    )
-                }
+            db.rollback()
 
-            db.execute(
-                text("""
-                    UPDATE appointments
-                    SET status = 'CANCELLED'
-                    WHERE id = :appointment_id
-                """),
-                {
-                    "appointment_id": appointment_id
-                }
-            )
+            return {
+                "success": False,
+                "message": (
+                    "Appointment not found."
+                )
+            }
 
-            db.execute(
-                text("""
-                    UPDATE appointment_slots
-                    SET status = 'AVAILABLE'
-                    WHERE id = :slot_id
-                """),
-                {
-                    "slot_id": appointment.slot_id
-                }
-            )
+        # -------------------------------------------------
+        # 2. Check appointment status
+        # -------------------------------------------------
+
+        if appointment.status != "CONFIRMED":
+
+            db.rollback()
+
+            return {
+                "success": False,
+                "message": (
+                    "This appointment cannot be "
+                    "cancelled because it is already "
+                    f"{appointment.status}."
+                )
+            }
+
+        # -------------------------------------------------
+        # 3. Lock the appointment slot
+        # -------------------------------------------------
+
+        slot = db.execute(
+            text("""
+                SELECT
+                    id,
+                    doctor_id,
+                    status,
+                    start_time,
+                    end_time
+
+                FROM appointment_slots
+
+                WHERE id = :slot_id
+
+                FOR UPDATE
+            """),
+            {
+                "slot_id": appointment.slot_id
+            }
+        ).fetchone()
+
+        if not slot:
+
+            db.rollback()
+
+            return {
+                "success": False,
+                "message": (
+                    "The appointment slot associated "
+                    "with this appointment could not "
+                    "be found."
+                )
+            }
+
+        # -------------------------------------------------
+        # 4. Cancel appointment
+        # -------------------------------------------------
+
+        update_appointment = db.execute(
+            text("""
+                UPDATE appointments
+
+                SET status = 'CANCELLED'
+
+                WHERE id = :appointment_id
+
+                AND status = 'CONFIRMED'
+            """),
+            {
+                "appointment_id": appointment_id
+            }
+        )
+
+        if update_appointment.rowcount == 0:
+
+            db.rollback()
+
+            return {
+                "success": False,
+                "message": (
+                    "The appointment could not be "
+                    "cancelled."
+                )
+            }
+
+        # -------------------------------------------------
+        # 5. RELEASE THE SLOT
+        #
+        # This is the important fix.
+        # -------------------------------------------------
+
+        update_slot = db.execute(
+            text("""
+                UPDATE appointment_slots
+
+                SET status = 'AVAILABLE'
+
+                WHERE id = :slot_id
+            """),
+            {
+                "slot_id": appointment.slot_id
+            }
+        )
+
+        if update_slot.rowcount == 0:
+
+            db.rollback()
+
+            return {
+                "success": False,
+                "message": (
+                    "The appointment was not cancelled "
+                    "because its slot could not be "
+                    "released."
+                )
+            }
+
+        # -------------------------------------------------
+        # 6. Commit both changes together
+        # -------------------------------------------------
+
+        db.commit()
+
+        # -------------------------------------------------
+        # 7. Verify slot status after commit
+        # -------------------------------------------------
+
+        verification = db.execute(
+            text("""
+                SELECT
+                    status
+
+                FROM appointment_slots
+
+                WHERE id = :slot_id
+            """),
+            {
+                "slot_id": appointment.slot_id
+            }
+        ).fetchone()
+
+        if not verification:
+
+            return {
+                "success": False,
+                "message": (
+                    "Appointment was cancelled, but "
+                    "the slot could not be verified."
+                )
+            }
+
+        if verification.status != "AVAILABLE":
+
+            return {
+                "success": False,
+                "message": (
+                    "Appointment was cancelled, but "
+                    "the appointment slot was not "
+                    "released."
+                )
+            }
 
         return {
             "success": True,
-            "message": "Appointment cancelled successfully."
+            "message": (
+                "Appointment cancelled successfully."
+            ),
+            "appointment_id": appointment_id,
+            "slot_id": appointment.slot_id
         }
 
     except Exception:
