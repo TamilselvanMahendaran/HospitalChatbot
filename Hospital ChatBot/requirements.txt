@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+streamlit
+requests
+sqlalchemy
+psycopg2-binary
+pydantic
+pydantic-settings
+python-dotenv
+google-genai
